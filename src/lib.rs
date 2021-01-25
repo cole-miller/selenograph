@@ -16,6 +16,7 @@ use ordered_float::OrderedFloat;
 pub enum Key {
     Bool(bool),
     Integer(i128),
+    HighU128(u128),
     F32(OrderedFloat<f32>),
     F64(OrderedFloat<f64>),
     Char(char),
@@ -190,7 +191,6 @@ impl serde::ser::SerializeMap for SerializeMap {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
-    BigU128(u128),
     OddKey(Key),
     OddValue(Key),
     Custom(String),
@@ -268,9 +268,9 @@ impl serde::Serializer for Serializer {
     }
 
     fn serialize_u128(self, v: u128) -> Result<Self::Ok, Self::Error> {
-        i128::try_from(v)
+        Ok(i128::try_from(v)
             .map(Key::Integer)
-            .map_err(|_| Error::BigU128(v))
+            .unwrap_or(Key::HighU128(v)))
     }
 
     fn serialize_f32(self, v: f32) -> Result<Self::Ok, Self::Error> {
