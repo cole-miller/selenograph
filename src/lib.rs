@@ -5,21 +5,19 @@ extern crate alloc;
 use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
-use alloc::string::String;
-use alloc::string::ToString;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use core::cmp::Ordering;
 use core::convert::{TryFrom, TryInto};
 use core::hash::{BuildHasher, Hash, Hasher};
 use hashbrown::raw::RawTable;
 use ordered_float::OrderedFloat;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum Key {
     Bool(bool),
     Integer(i128),
-    F32(f32),
-    F64(f64),
+    F32(OrderedFloat<f32>),
+    F64(OrderedFloat<f64>),
     Char(char),
     String(Box<str>),
     Bytes(Box<[u8]>),
@@ -28,96 +26,6 @@ pub enum Key {
     Variant(u32, Box<Self>),
     Seq(Box<[Self]>),
     Map(BTreeMap<Self, Self>),
-}
-
-impl Key {
-    fn discriminant(&self) -> usize {
-        match self {
-            Self::Bool(..) => 0,
-            Self::Integer(..) => 1,
-            Self::F32(..) => 2,
-            Self::F64(..) => 3,
-            Self::Char(..) => 4,
-            Self::String(..) => 5,
-            Self::Bytes(..) => 6,
-            Self::Option(..) => 7,
-            Self::Unit => 8,
-            Self::Variant(..) => 9,
-            Self::Seq(..) => 10,
-            Self::Map(..) => 11,
-        }
-    }
-}
-
-impl PartialEq for Key {
-    fn eq(&self, rhs: &Self) -> bool {
-        match (self, rhs) {
-            (Self::Bool(x), Self::Bool(y)) => x == y,
-            (Self::Integer(x), Self::Integer(y)) => x == y,
-            (Self::F32(x), Self::F32(y)) => OrderedFloat(*x) == OrderedFloat(*y),
-            (Self::F64(x), Self::F64(y)) => OrderedFloat(*x) == OrderedFloat(*y),
-            (Self::Char(x), Self::Char(y)) => x == y,
-            (Self::String(x), Self::String(y)) => x == y,
-            (Self::Bytes(x), Self::Bytes(y)) => x == y,
-            (Self::Option(x), Self::Option(y)) => x == y,
-            (Self::Unit, Self::Unit) => true,
-            (Self::Variant(x, u), Self::Variant(y, v)) => x == y && u == v,
-            (Self::Seq(x), Self::Seq(y)) => x == y,
-            (Self::Map(x), Self::Map(y)) => x == y,
-            _ => false,
-        }
-    }
-}
-
-impl Eq for Key {}
-
-impl PartialOrd for Key {
-    fn partial_cmp(&self, rhs: &Self) -> Option<Ordering> {
-        Some(self.cmp(rhs))
-    }
-}
-
-impl Ord for Key {
-    fn cmp(&self, rhs: &Self) -> Ordering {
-        match (self, rhs) {
-            (Self::Bool(x), Self::Bool(y)) => x.cmp(y),
-            (Self::Integer(x), Self::Integer(y)) => x.cmp(y),
-            (Self::F32(x), Self::F32(y)) => OrderedFloat(*x).cmp(&OrderedFloat(*y)),
-            (Self::F64(x), Self::F64(y)) => OrderedFloat(*x).cmp(&OrderedFloat(*y)),
-            (Self::Char(x), Self::Char(y)) => x.cmp(y),
-            (Self::String(x), Self::String(y)) => x.cmp(y),
-            (Self::Bytes(x), Self::Bytes(y)) => x.cmp(y),
-            (Self::Option(x), Self::Option(y)) => x.cmp(y),
-            (Self::Unit, Self::Unit) => Ordering::Equal,
-            (Self::Variant(x, u), Self::Variant(y, v)) => x.cmp(y).then(u.cmp(v)),
-            (Self::Seq(x), Self::Seq(y)) => x.cmp(y),
-            (Self::Map(x), Self::Map(y)) => x.cmp(y),
-            (x, y) => x.discriminant().cmp(&y.discriminant()),
-        }
-    }
-}
-
-impl Hash for Key {
-    fn hash<H: Hasher>(&self, hasher: &mut H) {
-        core::mem::discriminant(self).hash(hasher);
-        match self {
-            Self::Bool(x) => x.hash(hasher),
-            Self::Integer(x) => x.hash(hasher),
-            Self::F32(x) => OrderedFloat(*x).hash(hasher),
-            Self::F64(x) => OrderedFloat(*x).hash(hasher),
-            Self::Char(x) => x.hash(hasher),
-            Self::String(x) => x.hash(hasher),
-            Self::Bytes(x) => x.hash(hasher),
-            Self::Option(x) => x.hash(hasher),
-            Self::Unit => ().hash(hasher),
-            Self::Variant(x, u) => {
-                x.hash(hasher);
-                u.hash(hasher);
-            }
-            Self::Seq(x) => x.hash(hasher),
-            Self::Map(x) => x.hash(hasher),
-        }
-    }
 }
 
 pub struct Serializer;
@@ -366,11 +274,11 @@ impl serde::Serializer for Serializer {
     }
 
     fn serialize_f32(self, v: f32) -> Result<Self::Ok, Self::Error> {
-        Ok(Key::F32(v))
+        Ok(Key::F32(OrderedFloat(v)))
     }
 
     fn serialize_f64(self, v: f64) -> Result<Self::Ok, Self::Error> {
-        Ok(Key::F64(v))
+        Ok(Key::F64(OrderedFloat(v)))
     }
 
     fn serialize_char(self, v: char) -> Result<Self::Ok, Self::Error> {
