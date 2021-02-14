@@ -5,11 +5,23 @@ version = "0.1.0"
 authors = ["Cole Miller <m@cole-miller.net>"]
 edition = "2018"
 
-[dependencies]
-ahash = { version = "0.6.3", default-features = false }
-hashbrown = { git = "https://github.com/rust-lang/hashbrown", default-features = false, features = ["raw"] }
-ordered-float = { version = "2", default-features = false }
-serde = { version = "1", default-features = false, features = ["alloc"] }
+[dependencies.ahash]
+version = "0.6.3"
+default-features = false
+
+[dependencies.hashbrown]
+git = "https://github.com/rust-lang/hashbrown"
+default-features = false
+features = ["raw"]
+
+[dependencies.ordered-float]
+version = "2"
+default-features = false
+
+[dependencies.serde]
+version = "1"
+default-features = false
+features = ["alloc"]
 
 [dev-dependencies]
 serde_derive = "1"

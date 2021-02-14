@@ -1,41 +1,43 @@
 #![no_std]
+#![allow(clippy::derive_hash_xor_eq)]
 
 extern crate alloc;
 
 use alloc::boxed::Box;
-use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 use core::convert::TryInto;
 use core::hash::{BuildHasher, Hash, Hasher};
+#[allow(unused)]
+use core::mem::{replace, swap, take};
+use core::ops::Neg;
 use hashbrown::raw::RawTable;
 use ordered_float::OrderedFloat;
+use serde::Serialize;
 
-#[derive(Debug)]
-#[non_exhaustive]
-pub enum Error {
-    OddKey(Key),
-    OddValue(Key),
-    MissingValue,
-    Custom(String),
+macro_rules! hash {
+    ( $h:expr ; $( $x:expr ),+ ) => {
+        $( $x.hash($h); )*
+    };
 }
 
-impl core::fmt::Display for Error {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::OddKey(k) => write!(f, "unexpected key in map: {:?}", k),
-            Self::OddValue(v) => write!(f, "unexpected value in map: {:?}", v),
-            Self::MissingValue => write!(f, "map ended with unpaired key"),
-            Self::Custom(msg) => write!(f, "{}", msg),
+macro_rules! digest {
+    ( $h:expr ; $( $x:expr ),+ ) => {
+        #[allow(clippy::unnecessary_mut_passed)]
+        {
+            hash! { $h; $( $x ),* }
+            $h.finish()
         }
-    }
+    };
 }
 
-impl serde::ser::Error for Error {
-    fn custom<T: core::fmt::Display>(msg: T) -> Self {
-        Self::Custom(msg.to_string())
-    }
+macro_rules! build_digest {
+    ( $b:expr ; $( $x:expr ),+ ) => {
+        {
+            let mut hasher = $b.build_hasher();
+            digest!(&mut hasher; $( $x ),*)
+        }
+    };
 }
-
-pub type Result<T, E = Error> = core::result::Result<T, E>;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum Key {
@@ -287,6 +289,16 @@ pub enum Key {
     Map(Box<[(Self, Self)]>),
 }
 
+impl Key {
+    fn as_integer(&self) -> Option<i128> {
+        if let Self::Integer(x) = self {
+            Some(*x)
+        } else {
+            None
+        }
+    }
+}
+
 impl Hash for Key {
     fn hash<H: Hasher>(&self, state: &mut H) {
         match self {
@@ -392,969 +404,273 @@ impl Hash for Key {
     }
 }
 
-pub mod ser {
-    use crate::Key;
-    use alloc::borrow::ToOwned;
-    use alloc::boxed::Box;
-    use alloc::string::ToString;
-    use alloc::vec::Vec;
-    use core::convert::TryFrom;
-    use ordered_float::OrderedFloat;
+pub mod ser;
 
-    pub struct Serializer;
-
-    pub struct SerializeSeq(Vec<Key>);
-
-    impl serde::ser::SerializeSeq for SerializeSeq {
-        type Ok = Key;
-
-        type Error = crate::Error;
-
-        fn serialize_element<T: serde::Serialize + ?Sized>(
-            &mut self,
-            v: &T,
-        ) -> Result<(), Self::Error> {
-            self.0.push(v.serialize(Serializer)?);
-
-            Ok(())
-        }
-
-        fn end(self) -> Result<Self::Ok, Self::Error> {
-            Ok(Key::Seq(self.0.into()))
-        }
-    }
-
-    pub struct SerializeTuple(Vec<Key>);
-
-    impl serde::ser::SerializeTuple for SerializeTuple {
-        type Ok = Key;
-
-        type Error = crate::Error;
-
-        fn serialize_element<T: serde::Serialize + ?Sized>(
-            &mut self,
-            value: &T,
-        ) -> Result<(), Self::Error> {
-            self.0.push(to_key(value)?);
-
-            Ok(())
-        }
-
-        fn end(self) -> Result<Self::Ok, Self::Error> {
-            Ok(Key::Tuple(self.0.into()))
-        }
-    }
-
-    pub struct SerializeTupleStruct(&'static str, Vec<Key>);
-
-    impl serde::ser::SerializeTupleStruct for SerializeTupleStruct {
-        type Ok = Key;
-
-        type Error = crate::Error;
-
-        fn serialize_field<T: serde::Serialize + ?Sized>(
-            &mut self,
-            value: &T,
-        ) -> Result<(), Self::Error> {
-            self.1.push(to_key(value)?);
-
-            Ok(())
-        }
-
-        fn end(self) -> Result<Self::Ok, Self::Error> {
-            Ok(Key::TupleStruct(self.0, self.1.into()))
-        }
-    }
-
-    impl serde::ser::SerializeStruct for SerializeTupleStruct {
-        type Ok = Key;
-
-        type Error = crate::Error;
-
-        fn serialize_field<T: serde::Serialize + ?Sized>(
-            &mut self,
-            _name: &'static str,
-            value: &T,
-        ) -> Result<(), Self::Error> {
-            self.1.push(to_key(value)?);
-
-            Ok(())
-        }
-
-        fn end(self) -> Result<Self::Ok, Self::Error> {
-            Ok(Key::TupleStruct(self.0, self.1.into()))
-        }
-    }
-
-    pub struct SerializeTupleVariant(&'static str, u32, Vec<Key>);
-
-    impl serde::ser::SerializeTupleVariant for SerializeTupleVariant {
-        type Ok = Key;
-
-        type Error = crate::Error;
-
-        fn serialize_field<T: serde::Serialize + ?Sized>(
-            &mut self,
-            v: &T,
-        ) -> Result<(), Self::Error> {
-            self.2.push(v.serialize(Serializer)?);
-
-            Ok(())
-        }
-
-        fn end(self) -> Result<Self::Ok, Self::Error> {
-            Ok(Key::TupleVariant(self.0, self.1, self.2.into()))
-        }
-    }
-
-    impl serde::ser::SerializeStructVariant for SerializeTupleVariant {
-        type Ok = Key;
-
-        type Error = crate::Error;
-
-        fn serialize_field<T: serde::Serialize + ?Sized>(
-            &mut self,
-            _name: &'static str,
-            v: &T,
-        ) -> Result<(), Self::Error> {
-            self.2.push(v.serialize(Serializer)?);
-
-            Ok(())
-        }
-
-        fn end(self) -> Result<Self::Ok, Self::Error> {
-            Ok(Key::TupleVariant(self.0, self.1, self.2.into()))
-        }
-    }
-
-    pub struct SerializeMap(Vec<(Key, Key)>, Option<Key>);
-
-    impl serde::ser::SerializeMap for SerializeMap {
-        type Ok = Key;
-
-        type Error = crate::Error;
-
-        fn serialize_key<T: serde::Serialize + ?Sized>(
-            &mut self,
-            key: &T,
-        ) -> Result<(), Self::Error> {
-            if let Some(k) = self.1.take() {
-                Err(crate::Error::OddKey(k))
-            } else {
-                self.1 = Some(key.serialize(Serializer)?);
-
-                Ok(())
-            }
-        }
-
-        fn serialize_value<T: serde::Serialize + ?Sized>(
-            &mut self,
-            value: &T,
-        ) -> Result<(), Self::Error> {
-            if let Some(k) = self.1.take() {
-                self.0.push((k, value.serialize(Serializer)?));
-
-                Ok(())
-            } else {
-                Err(crate::Error::OddValue(to_key(value)?))
-            }
-        }
-
-        fn end(self) -> Result<Self::Ok, Self::Error> {
-            if self.1.is_none() {
-                Ok(Key::Map(self.0.into()))
-            } else {
-                Err(crate::Error::MissingValue)
-            }
-        }
-    }
-
-    impl serde::Serializer for Serializer {
-        type Ok = Key;
-
-        type Error = crate::Error;
-
-        type SerializeSeq = SerializeSeq;
-
-        type SerializeTuple = SerializeTuple;
-
-        type SerializeTupleStruct = SerializeTupleStruct;
-
-        type SerializeTupleVariant = SerializeTupleVariant;
-
-        type SerializeMap = SerializeMap;
-
-        type SerializeStruct = SerializeTupleStruct;
-
-        type SerializeStructVariant = SerializeTupleVariant;
-
-        fn serialize_bool(self, v: bool) -> Result<Self::Ok, Self::Error> {
-            Ok(Key::Bool(v))
-        }
-
-        fn serialize_i8(self, v: i8) -> Result<Self::Ok, Self::Error> {
-            Ok(Key::Integer(v as i128))
-        }
-
-        fn serialize_i16(self, v: i16) -> Result<Self::Ok, Self::Error> {
-            Ok(Key::Integer(v as i128))
-        }
-
-        fn serialize_i32(self, v: i32) -> Result<Self::Ok, Self::Error> {
-            Ok(Key::Integer(v as i128))
-        }
-
-        fn serialize_i64(self, v: i64) -> Result<Self::Ok, Self::Error> {
-            Ok(Key::Integer(v as i128))
-        }
-
-        fn serialize_i128(self, v: i128) -> Result<Self::Ok, Self::Error> {
-            Ok(Key::Integer(v))
-        }
-
-        fn serialize_u8(self, v: u8) -> Result<Self::Ok, Self::Error> {
-            Ok(Key::Integer(v as i128))
-        }
-
-        fn serialize_u16(self, v: u16) -> Result<Self::Ok, Self::Error> {
-            Ok(Key::Integer(v as i128))
-        }
-
-        fn serialize_u32(self, v: u32) -> Result<Self::Ok, Self::Error> {
-            Ok(Key::Integer(v as i128))
-        }
-
-        fn serialize_u64(self, v: u64) -> Result<Self::Ok, Self::Error> {
-            Ok(Key::Integer(v as i128))
-        }
-
-        fn serialize_u128(self, v: u128) -> Result<Self::Ok, Self::Error> {
-            Ok(i128::try_from(v)
-                .map(Key::Integer)
-                .unwrap_or(Key::HighU128(v)))
-        }
-
-        fn serialize_f32(self, v: f32) -> Result<Self::Ok, Self::Error> {
-            Ok(Key::F32(OrderedFloat(v)))
-        }
-
-        fn serialize_f64(self, v: f64) -> Result<Self::Ok, Self::Error> {
-            Ok(Key::F64(OrderedFloat(v)))
-        }
-
-        fn serialize_char(self, v: char) -> Result<Self::Ok, Self::Error> {
-            Ok(Key::Char(v))
-        }
-
-        fn serialize_str(self, v: &str) -> Result<Self::Ok, Self::Error> {
-            Ok(Key::String(v.to_owned().into()))
-        }
-
-        fn serialize_bytes(self, v: &[u8]) -> Result<Self::Ok, Self::Error> {
-            Ok(Key::Bytes(v.to_owned().into()))
-        }
-
-        fn serialize_none(self) -> Result<Self::Ok, Self::Error> {
-            Ok(Key::Option(None))
-        }
-
-        fn serialize_some<T: serde::Serialize + ?Sized>(
-            self,
-            v: &T,
-        ) -> Result<Self::Ok, Self::Error> {
-            let ser = v.serialize(self)?;
-
-            Ok(Key::Option(Some(Box::new(ser))))
-        }
-
-        fn serialize_unit(self) -> Result<Self::Ok, Self::Error> {
-            Ok(Key::Unit)
-        }
-
-        fn serialize_unit_struct(self, name: &'static str) -> Result<Self::Ok, Self::Error> {
-            Ok(Key::UnitStruct(name))
-        }
-
-        fn serialize_unit_variant(
-            self,
-            name: &'static str,
-            index: u32,
-            _variant: &'static str,
-        ) -> Result<Self::Ok, Self::Error> {
-            Ok(Key::UnitVariant(name, index))
-        }
-
-        fn serialize_newtype_struct<T: serde::Serialize + ?Sized>(
-            self,
-            name: &'static str,
-            v: &T,
-        ) -> Result<Self::Ok, Self::Error> {
-            let inner = Box::new(to_key(v)?);
-
-            Ok(Key::NewtypeStruct(name, inner))
-        }
-
-        fn serialize_newtype_variant<T: serde::Serialize + ?Sized>(
-            self,
-            name: &'static str,
-            index: u32,
-            _variant: &'static str,
-            v: &T,
-        ) -> Result<Self::Ok, Self::Error> {
-            let inner = Box::new(v.serialize(self)?);
-
-            Ok(Key::NewtypeVariant(name, index, inner))
-        }
-
-        fn serialize_seq(self, len: Option<usize>) -> Result<Self::SerializeSeq, Self::Error> {
-            Ok(SerializeSeq(if let Some(z) = len {
-                Vec::with_capacity(z)
-            } else {
-                Vec::new()
-            }))
-        }
-
-        fn serialize_tuple(self, len: usize) -> Result<Self::SerializeTuple, Self::Error> {
-            Ok(SerializeTuple(Vec::with_capacity(len)))
-        }
-
-        fn serialize_tuple_struct(
-            self,
-            name: &'static str,
-            len: usize,
-        ) -> Result<Self::SerializeTupleStruct, Self::Error> {
-            Ok(SerializeTupleStruct(name, Vec::with_capacity(len)))
-        }
-
-        fn serialize_tuple_variant(
-            self,
-            name: &'static str,
-            index: u32,
-            _variant: &'static str,
-            len: usize,
-        ) -> Result<Self::SerializeTupleVariant, Self::Error> {
-            Ok(SerializeTupleVariant(name, index, Vec::with_capacity(len)))
-        }
-
-        fn serialize_map(self, len: Option<usize>) -> Result<Self::SerializeMap, Self::Error> {
-            Ok(SerializeMap(
-                if let Some(z) = len {
-                    Vec::with_capacity(z)
-                } else {
-                    Vec::new()
-                },
-                None,
-            ))
-        }
-
-        fn serialize_struct(
-            self,
-            name: &'static str,
-            len: usize,
-        ) -> Result<Self::SerializeStruct, Self::Error> {
-            self.serialize_tuple_struct(name, len)
-        }
-
-        fn serialize_struct_variant(
-            self,
-            name: &'static str,
-            index: u32,
-            _variant: &'static str,
-            len: usize,
-        ) -> Result<Self::SerializeStructVariant, Self::Error> {
-            Ok(SerializeTupleVariant(name, index, Vec::with_capacity(len)))
-        }
-
-        fn collect_str<T: core::fmt::Display + ?Sized>(
-            self,
-            v: &T,
-        ) -> Result<Self::Ok, Self::Error> {
-            Ok(Key::String(v.to_string().into()))
-        }
-
-        fn is_human_readable(&self) -> bool {
-            false
-        }
-    }
-
-    pub fn to_key<T: serde::Serialize + ?Sized>(v: &T) -> crate::Result<Key> {
-        v.serialize(Serializer)
-    }
-
-    pub mod hash {
-        use core::convert::TryFrom;
-        use core::hash::{Hash, Hasher};
-        use ordered_float::OrderedFloat;
-
-        #[derive(Clone, Debug, Eq, PartialEq)]
-        pub struct Index {
-            pub hash: u64,
-            pub integer: Option<i128>,
-        }
-
-        impl Index {
-            fn from_hash(hash: u64) -> Self {
-                Self {
-                    hash,
-                    integer: None,
-                }
-            }
-        }
-
-        pub struct Serializer<'a, H>(&'a mut H);
-
-        pub struct SerializeSeq<'a, H>(&'a mut H, usize);
-
-        impl<'a, H: Hasher> serde::ser::SerializeSeq for SerializeSeq<'a, H> {
-            type Ok = Index;
-
-            type Error = crate::Error;
-
-            fn serialize_element<T: serde::Serialize + ?Sized>(
-                &mut self,
-                value: &T,
-            ) -> Result<(), Self::Error> {
-                let _ = to_index(self.0, value)?;
-                self.1 += 1;
-
-                Ok(())
-            }
-
-            fn end(self) -> Result<Self::Ok, Self::Error> {
-                self.1.hash(self.0);
-
-                Ok(Index::from_hash(self.0.finish()))
-            }
-        }
-
-        pub struct SerializeTuple<'a, H>(&'a mut H);
-
-        impl<'a, H: Hasher> serde::ser::SerializeTuple for SerializeTuple<'a, H> {
-            type Ok = Index;
-
-            type Error = crate::Error;
-
-            fn serialize_element<T: serde::Serialize + ?Sized>(
-                &mut self,
-                value: &T,
-            ) -> Result<(), Self::Error> {
-                let _ = to_index(self.0, value)?;
-
-                Ok(())
-            }
-
-            fn end(self) -> Result<Self::Ok, Self::Error> {
-                Ok(Index::from_hash(self.0.finish()))
-            }
-        }
-
-        impl<'a, H: Hasher> serde::ser::SerializeTupleStruct for SerializeTuple<'a, H> {
-            type Ok = Index;
-
-            type Error = crate::Error;
-
-            fn serialize_field<T: serde::Serialize + ?Sized>(
-                &mut self,
-                value: &T,
-            ) -> Result<(), Self::Error> {
-                let _ = to_index(self.0, value)?;
-
-                Ok(())
-            }
-
-            fn end(self) -> Result<Self::Ok, Self::Error> {
-                Ok(Index::from_hash(self.0.finish()))
-            }
-        }
-
-        impl<'a, H: Hasher> serde::ser::SerializeTupleVariant for SerializeTuple<'a, H> {
-            type Ok = Index;
-
-            type Error = crate::Error;
-
-            fn serialize_field<T: serde::Serialize + ?Sized>(
-                &mut self,
-                value: &T,
-            ) -> Result<(), Self::Error> {
-                let _ = to_index(self.0, value)?;
-
-                Ok(())
-            }
-
-            fn end(self) -> Result<Self::Ok, Self::Error> {
-                Ok(Index::from_hash(self.0.finish()))
-            }
-        }
-
-        impl<'a, H: Hasher> serde::ser::SerializeStruct for SerializeTuple<'a, H> {
-            type Ok = Index;
-
-            type Error = crate::Error;
-
-            fn serialize_field<T: serde::Serialize + ?Sized>(
-                &mut self,
-                _name: &'static str,
-                value: &T,
-            ) -> Result<(), Self::Error> {
-                let _ = to_index(self.0, value)?;
-
-                Ok(())
-            }
-
-            fn end(self) -> Result<Self::Ok, Self::Error> {
-                Ok(Index::from_hash(self.0.finish()))
-            }
-        }
-
-        impl<'a, H: Hasher> serde::ser::SerializeStructVariant for SerializeTuple<'a, H> {
-            type Ok = Index;
-
-            type Error = crate::Error;
-
-            fn serialize_field<T: serde::Serialize + ?Sized>(
-                &mut self,
-                _name: &'static str,
-                value: &T,
-            ) -> Result<(), Self::Error> {
-                let _ = to_index(self.0, value)?;
-
-                Ok(())
-            }
-
-            fn end(self) -> Result<Self::Ok, Self::Error> {
-                Ok(Index::from_hash(self.0.finish()))
-            }
-        }
-
-        enum State {
-            WantKey,
-            WantValue,
-        }
-
-        pub struct SerializeMap<'a, H>(&'a mut H, State, usize);
-
-        impl<'a, H: Hasher> serde::ser::SerializeMap for SerializeMap<'a, H> {
-            type Ok = Index;
-
-            type Error = crate::Error;
-
-            fn serialize_key<T: serde::Serialize + ?Sized>(
-                &mut self,
-                key: &T,
-            ) -> Result<(), Self::Error> {
-                if matches!(self.1, State::WantKey) {
-                    let _ = to_index(self.0, key);
-                    self.1 = State::WantValue;
-
-                    Ok(())
-                } else {
-                    Err(Self::Error::OddKey(super::to_key(key)?))
-                }
-            }
-
-            fn serialize_value<T: serde::Serialize + ?Sized>(
-                &mut self,
-                value: &T,
-            ) -> Result<(), Self::Error> {
-                if matches!(self.1, State::WantValue) {
-                    let _ = to_index(self.0, value);
-                    self.1 = State::WantKey;
-                    self.2 += 1;
-
-                    Ok(())
-                } else {
-                    Err(Self::Error::OddValue(super::to_key(value)?))
-                }
-            }
-
-            fn end(self) -> Result<Self::Ok, Self::Error> {
-                if matches!(self.1, State::WantKey) {
-                    self.2.hash(self.0);
-
-                    Ok(Index::from_hash(self.0.finish()))
-                } else {
-                    Err(crate::Error::MissingValue)
-                }
-            }
-        }
-
-        impl<'a, H: Hasher> serde::Serializer for Serializer<'a, H> {
-            type Ok = Index;
-
-            type Error = crate::Error;
-
-            type SerializeSeq = SerializeSeq<'a, H>;
-
-            type SerializeTuple = SerializeTuple<'a, H>;
-
-            type SerializeTupleStruct = SerializeTuple<'a, H>;
-
-            type SerializeTupleVariant = SerializeTuple<'a, H>;
-
-            type SerializeMap = SerializeMap<'a, H>;
-
-            type SerializeStruct = SerializeTuple<'a, H>;
-
-            type SerializeStructVariant = SerializeTuple<'a, H>;
-
-            fn serialize_bool(self, v: bool) -> Result<Self::Ok, Self::Error> {
-                0_u32.hash(self.0);
-                v.hash(self.0);
-
-                Ok(Index::from_hash(self.0.finish()))
-            }
-
-            fn serialize_i8(self, v: i8) -> Result<Self::Ok, Self::Error> {
-                1_u32.hash(self.0);
-                let v = v as i128;
-                v.hash(self.0);
-
-                Ok(Index {
-                    hash: self.0.finish(),
-                    integer: Some(v),
-                })
-            }
-
-            fn serialize_i16(self, v: i16) -> Result<Self::Ok, Self::Error> {
-                1_u32.hash(self.0);
-                let v = v as i128;
-                v.hash(self.0);
-
-                Ok(Index {
-                    hash: self.0.finish(),
-                    integer: Some(v),
-                })
-            }
-
-            fn serialize_i32(self, v: i32) -> Result<Self::Ok, Self::Error> {
-                1_u32.hash(self.0);
-                let v = v as i128;
-                v.hash(self.0);
-
-                Ok(Index {
-                    hash: self.0.finish(),
-                    integer: Some(v),
-                })
-            }
-
-            fn serialize_i64(self, v: i64) -> Result<Self::Ok, Self::Error> {
-                1_u32.hash(self.0);
-                let v = v as i128;
-                v.hash(self.0);
-
-                Ok(Index {
-                    hash: self.0.finish(),
-                    integer: Some(v),
-                })
-            }
-
-            fn serialize_i128(self, v: i128) -> Result<Self::Ok, Self::Error> {
-                1_u32.hash(self.0);
-                let v = v as i128;
-                v.hash(self.0);
-
-                Ok(Index {
-                    hash: self.0.finish(),
-                    integer: Some(v),
-                })
-            }
-
-            fn serialize_u8(self, v: u8) -> Result<Self::Ok, Self::Error> {
-                1_u32.hash(self.0);
-                let v = v as i128;
-                v.hash(self.0);
-
-                Ok(Index {
-                    hash: self.0.finish(),
-                    integer: Some(v),
-                })
-            }
-
-            fn serialize_u16(self, v: u16) -> Result<Self::Ok, Self::Error> {
-                1_u32.hash(self.0);
-                let v = v as i128;
-                v.hash(self.0);
-
-                Ok(Index {
-                    hash: self.0.finish(),
-                    integer: Some(v),
-                })
-            }
-
-            fn serialize_u32(self, v: u32) -> Result<Self::Ok, Self::Error> {
-                1_u32.hash(self.0);
-                let v = v as i128;
-                v.hash(self.0);
-
-                Ok(Index {
-                    hash: self.0.finish(),
-                    integer: Some(v),
-                })
-            }
-
-            fn serialize_u64(self, v: u64) -> Result<Self::Ok, Self::Error> {
-                1_u32.hash(self.0);
-                let v = v as i128;
-                v.hash(self.0);
-
-                Ok(Index {
-                    hash: self.0.finish(),
-                    integer: Some(v),
-                })
-            }
-
-            fn serialize_u128(self, v: u128) -> Result<Self::Ok, Self::Error> {
-                if let Ok(i) = i128::try_from(v) {
-                    1_u32.hash(self.0);
-                    i.hash(self.0);
-
-                    Ok(Index {
-                        hash: self.0.finish(),
-                        integer: Some(i),
-                    })
-                } else {
-                    2_u32.hash(self.0);
-                    v.hash(self.0);
-
-                    Ok(Index {
-                        hash: self.0.finish(),
-                        integer: None,
-                    })
-                }
-            }
-
-            fn serialize_f32(self, v: f32) -> Result<Self::Ok, Self::Error> {
-                3_u32.hash(self.0);
-                OrderedFloat(v).hash(self.0);
-
-                Ok(Index::from_hash(self.0.finish()))
-            }
-
-            fn serialize_f64(self, v: f64) -> Result<Self::Ok, Self::Error> {
-                4_u32.hash(self.0);
-                OrderedFloat(v).hash(self.0);
-
-                Ok(Index::from_hash(self.0.finish()))
-            }
-
-            fn serialize_char(self, v: char) -> Result<Self::Ok, Self::Error> {
-                5_u32.hash(self.0);
-                v.hash(self.0);
-
-                Ok(Index::from_hash(self.0.finish()))
-            }
-
-            fn serialize_str(self, v: &str) -> Result<Self::Ok, Self::Error> {
-                6_u32.hash(self.0);
-                v.hash(self.0);
-
-                Ok(Index::from_hash(self.0.finish()))
-            }
-
-            fn serialize_bytes(self, v: &[u8]) -> Result<Self::Ok, Self::Error> {
-                7_u32.hash(self.0);
-                v.hash(self.0);
-
-                Ok(Index::from_hash(self.0.finish()))
-            }
-
-            fn serialize_none(self) -> Result<Self::Ok, Self::Error> {
-                8_u32.hash(self.0);
-
-                Ok(Index::from_hash(self.0.finish()))
-            }
-
-            fn serialize_some<T: serde::Serialize + ?Sized>(
-                self,
-                value: &T,
-            ) -> Result<Self::Ok, Self::Error> {
-                9_u32.hash(self.0);
-
-                value.serialize(Self(self.0))
-            }
-
-            fn serialize_unit(self) -> Result<Self::Ok, Self::Error> {
-                10_u32.hash(self.0);
-
-                Ok(Index::from_hash(self.0.finish()))
-            }
-
-            fn serialize_unit_struct(self, name: &'static str) -> Result<Self::Ok, Self::Error> {
-                11_u32.hash(self.0);
-                name.hash(self.0);
-
-                Ok(Index::from_hash(self.0.finish()))
-            }
-
-            fn serialize_unit_variant(
-                self,
-                name: &'static str,
-                index: u32,
-                _variant: &'static str,
-            ) -> Result<Self::Ok, Self::Error> {
-                12_u32.hash(self.0);
-                name.hash(self.0);
-                index.hash(self.0);
-
-                Ok(Index::from_hash(self.0.finish()))
-            }
-
-            fn serialize_newtype_struct<T: serde::Serialize + ?Sized>(
-                self,
-                name: &'static str,
-                value: &T,
-            ) -> Result<Self::Ok, Self::Error> {
-                13_u32.hash(self.0);
-                name.hash(self.0);
-
-                value.serialize(self)
-            }
-
-            fn serialize_newtype_variant<T: serde::Serialize + ?Sized>(
-                self,
-                name: &'static str,
-                index: u32,
-                _variant: &'static str,
-                value: &T,
-            ) -> Result<Self::Ok, Self::Error> {
-                14_u32.hash(self.0);
-                name.hash(self.0);
-                index.hash(self.0);
-
-                value.serialize(self)
-            }
-
-            fn serialize_seq(self, _len: Option<usize>) -> Result<Self::SerializeSeq, Self::Error> {
-                15_u32.hash(self.0);
-
-                Ok(SerializeSeq(self.0, 0))
-            }
-
-            fn serialize_tuple(self, _len: usize) -> Result<Self::SerializeTuple, Self::Error> {
-                16_u32.hash(self.0);
-
-                Ok(SerializeTuple(self.0))
-            }
-
-            fn serialize_tuple_struct(
-                self,
-                name: &'static str,
-                _len: usize,
-            ) -> Result<Self::SerializeTupleStruct, Self::Error> {
-                17_u32.hash(self.0);
-                name.hash(self.0);
-
-                Ok(SerializeTuple(self.0))
-            }
-
-            fn serialize_tuple_variant(
-                self,
-                name: &'static str,
-                index: u32,
-                _variant: &'static str,
-                _len: usize,
-            ) -> Result<Self::SerializeTupleVariant, Self::Error> {
-                18_u32.hash(self.0);
-                name.hash(self.0);
-                index.hash(self.0);
-
-                Ok(SerializeTuple(self.0))
-            }
-
-            fn serialize_map(self, _len: Option<usize>) -> Result<Self::SerializeMap, Self::Error> {
-                19_u32.hash(self.0);
-
-                Ok(SerializeMap(self.0, State::WantKey, 0))
-            }
-
-            fn serialize_struct(
-                self,
-                name: &'static str,
-                _len: usize,
-            ) -> Result<Self::SerializeStruct, Self::Error> {
-                17_u32.hash(self.0);
-                name.hash(self.0);
-
-                Ok(SerializeTuple(self.0))
-            }
-
-            fn serialize_struct_variant(
-                self,
-                name: &'static str,
-                index: u32,
-                _variant: &'static str,
-                _len: usize,
-            ) -> Result<Self::SerializeStructVariant, Self::Error> {
-                18_u32.hash(self.0);
-                name.hash(self.0);
-                index.hash(self.0);
-
-                Ok(SerializeTuple(self.0))
-            }
-
-            fn is_human_readable(&self) -> bool {
-                false
-            }
-        }
-
-        pub fn to_index<H: Hasher, T: serde::Serialize + ?Sized>(
-            hasher: &mut H,
-            v: &T,
-        ) -> crate::Result<Index> {
-            v.serialize(Serializer(hasher))
-        }
-    }
-}
-
-pub use crate::ser::hash::to_index;
 pub use crate::ser::{to_key, Serializer};
+pub use crate::ser::{Error, Result};
+
+use crate::ser::hash::to_index;
+use crate::ser::integer::to_integer;
 
 #[derive(Clone, Copy)]
 struct Offset(usize);
 
 impl Offset {
-    fn translate_index(&self, x: i128) -> Option<usize> {
+    fn translate_index(self, i: usize) -> i128 {
+        i as i128 - self.0 as i128
+    }
+
+    fn translate_index_inv(self, x: i128) -> Option<usize> {
         (self.0 as i128).checked_add(x)?.try_into().ok()
     }
 }
 
 pub struct Table<T, S = ahash::RandomState> {
     offset_of_zero: Offset,
-    slice_part: Box<[Option<T>]>,
+    slice_part: Vec<Option<T>>,
     hash_builder: S,
     hash_part: RawTable<(Key, T)>,
 }
 
+impl<T, S: Default> Default for Table<T, S> {
+    fn default() -> Self {
+        Self {
+            offset_of_zero: Offset(0),
+            slice_part: Vec::new(),
+            hash_builder: Default::default(),
+            hash_part: RawTable::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 pub enum Pair<'a, T> {
     Implicit(i128, &'a T),
-    Explicit(&'a (Key, T)),
+    Explicit(&'a Key, &'a T),
 }
 
 impl<'a, T> Pair<'a, T> {
     pub fn value(self) -> &'a T {
         match self {
             Self::Implicit(_, val) => val,
-            Self::Explicit((_, val)) => val,
+            Self::Explicit(_, val) => val,
         }
     }
 }
 
 pub enum PairMut<'a, T> {
     Implicit(i128, &'a mut T),
-    Explicit(&'a mut (Key, T)),
+    Explicit(&'a Key, &'a mut T),
 }
 
 impl<'a, T> PairMut<'a, T> {
     pub fn value(self) -> &'a mut T {
         match self {
             Self::Implicit(_, val) => val,
-            Self::Explicit((_, val)) => val,
+            Self::Explicit(_, val) => val,
+        }
+    }
+}
+
+const SIZE_BITS: usize = core::mem::size_of::<usize>() * 8;
+
+struct Counts {
+    pub nonneg: [usize; SIZE_BITS],
+    pub neg: [usize; SIZE_BITS],
+}
+
+impl Counts {
+    fn new() -> Self {
+        Self {
+            nonneg: [0; SIZE_BITS],
+            neg: [0; SIZE_BITS],
+        }
+    }
+
+    fn tally(&mut self, ints: impl Iterator<Item = i128>) {
+        for x in ints {
+            if x >= 0 {
+                self.nonneg[SIZE_BITS - x.leading_zeros() as usize] += 1;
+            } else {
+                self.neg[SIZE_BITS - x.neg().leading_zeros() as usize - 1] += 1;
+            }
+        }
+    }
+
+    fn nonneg_size(&self) -> usize {
+        compute_size(&self.nonneg)
+    }
+
+    fn neg_size(&self) -> usize {
+        compute_size(&self.neg)
+    }
+}
+
+fn compute_size(counts: &[usize]) -> usize {
+    counts
+        .iter()
+        .copied()
+        .enumerate()
+        .fold((0, 0), |(tot, z), (i, n)| {
+            if n > 0 && 2 * (tot + n) >= 1 << i {
+                (tot + n, 1 << i)
+            } else {
+                (tot + n, z)
+            }
+        })
+        .1
+}
+
+enum Iter<'a, T> {
+    InSlice(
+        i128,
+        core::slice::Iter<'a, Option<T>>,
+        &'a RawTable<(Key, T)>,
+    ),
+    InHash(hashbrown::raw::RawIter<(Key, T)>),
+}
+
+impl<'a, T> Iterator for Iter<'a, T> {
+    type Item = Pair<'a, T>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::InSlice(x, it, h) => {
+                let v = loop {
+                    match it.next() {
+                        None => unsafe {
+                            *self = Self::InHash(h.iter());
+                            return self.next();
+                        },
+                        Some(None) => *x += 1,
+                        Some(Some(v)) => break v,
+                    }
+                };
+
+                let cur = *x;
+                *x += 1;
+                Some(Pair::Implicit(cur, v))
+            }
+            Self::InHash(it) => unsafe {
+                it.next()
+                    .map(|bkt| bkt.as_ref())
+                    .map(|(k, v)| Pair::Explicit(k, v))
+            },
+        }
+    }
+}
+
+enum IterMut<'a, T> {
+    InSlice(
+        i128,
+        core::slice::IterMut<'a, Option<T>>,
+        &'a mut RawTable<(Key, T)>,
+    ),
+    InHash(hashbrown::raw::RawIter<(Key, T)>),
+}
+
+impl<'a, T> Iterator for IterMut<'a, T> {
+    type Item = PairMut<'a, T>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::InSlice(x, it, h) => {
+                let v = loop {
+                    match it.next() {
+                        None => unsafe {
+                            *self = Self::InHash(h.iter());
+                            return self.next();
+                        },
+                        Some(None) => *x += 1,
+                        Some(Some(v)) => break v,
+                    }
+                };
+
+                let cur = *x;
+                *x += 1;
+                Some(PairMut::Implicit(cur, v))
+            }
+            Self::InHash(it) => unsafe {
+                it.next()
+                    .map(|bkt| bkt.as_mut())
+                    .map(|(k, v)| PairMut::Explicit(k, v))
+            },
+        }
+    }
+}
+
+enum _IntoIter<T> {
+    InSlice(i128, alloc::vec::IntoIter<Option<T>>, RawTable<(Key, T)>),
+    InHash(hashbrown::raw::RawIntoIter<(Key, T)>),
+}
+
+pub struct IntoIter<T>(_IntoIter<T>);
+
+impl<T> Iterator for IntoIter<T> {
+    type Item = (Key, T);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match &mut self.0 {
+            _IntoIter::InSlice(x, it, h) => {
+                let v = loop {
+                    match it.next() {
+                        None => {
+                            self.0 = _IntoIter::InHash(replace(h, RawTable::new()).into_iter());
+                            return self.next();
+                        }
+                        Some(None) => *x += 1,
+                        Some(Some(v)) => break v,
+                    }
+                };
+
+                let cur = *x;
+                *x += 1;
+                Some((Key::Integer(cur), v))
+            }
+            _IntoIter::InHash(it) => it.next(),
         }
     }
 }
 
 impl<T, S: BuildHasher> Table<T, S> {
-    pub fn get_pair_ser<K: serde::Serialize + ?Sized>(&self, key: &K) -> Option<Pair<'_, T>> {
+    pub fn new() -> Self
+    where
+        S: Default,
+    {
+        Default::default()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = Pair<'_, T>> {
+        let Self {
+            offset_of_zero,
+            slice_part,
+            hash_part,
+            ..
+        } = self;
+
+        Iter::InSlice(
+            offset_of_zero.translate_index(0),
+            slice_part.iter(),
+            &hash_part,
+        )
+    }
+
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = PairMut<'_, T>> {
+        let Self {
+            offset_of_zero,
+            slice_part,
+            hash_part,
+            ..
+        } = self;
+
+        IterMut::InSlice(
+            offset_of_zero.translate_index(0),
+            slice_part.iter_mut(),
+            hash_part,
+        )
+    }
+
+    pub fn get_pair<K: Serialize + ?Sized>(&self, key: &K) -> Option<Pair<'_, T>> {
         let Self {
             offset_of_zero,
             slice_part,
@@ -1362,23 +678,203 @@ impl<T, S: BuildHasher> Table<T, S> {
             hash_part,
         } = self;
 
-        let index = to_index(&mut hash_builder.build_hasher(), key).unwrap();
-
-        if let Some(x) = index.integer {
+        if let Some(x) = to_integer(key) {
             if let Some(i) = offset_of_zero
-                .translate_index(x)
+                .translate_index_inv(x)
                 .filter(|&i| i < slice_part.len())
             {
                 return slice_part[i].as_ref().map(|v| Pair::Implicit(x, v));
             }
         }
 
+        let index = to_index(&mut hash_builder.build_hasher(), key).unwrap();
         let mut ser = None;
         hash_part
             .get(index.hash, |(k, _)| {
                 k == ser.get_or_insert_with(|| to_key(key).unwrap())
             })
-            .map(Pair::Explicit)
+            .map(|(k, v)| Pair::Explicit(k, v))
+    }
+
+    pub fn get_pair_mut<K: Serialize + ?Sized>(&mut self, key: &K) -> Option<PairMut<'_, T>> {
+        let Self {
+            offset_of_zero,
+            slice_part,
+            hash_builder,
+            hash_part,
+        } = self;
+
+        if let Some(x) = to_integer(key) {
+            if let Some(i) = offset_of_zero
+                .translate_index_inv(x)
+                .filter(|&i| i < slice_part.len())
+            {
+                return slice_part[i].as_mut().map(|v| PairMut::Implicit(x, v));
+            }
+        }
+
+        let index = to_index(&mut hash_builder.build_hasher(), key).unwrap();
+        let mut ser = None;
+        hash_part
+            .get_mut(index.hash, |(k, _)| {
+                k == ser.get_or_insert_with(|| to_key(key).unwrap())
+            })
+            .map(|(k, v)| PairMut::Explicit(k, v))
+    }
+
+    pub fn insert<K: Serialize + ?Sized>(&mut self, key: &K, value: T) -> Option<T> {
+        let Self {
+            offset_of_zero,
+            slice_part,
+            hash_builder,
+            hash_part,
+        } = self;
+
+        if let Some(i) = to_integer(key).and_then(|x| {
+            offset_of_zero
+                .translate_index_inv(x)
+                .filter(|&i| i < slice_part.len())
+        }) {
+            return replace(&mut slice_part[i], Some(value));
+        }
+
+        let make_ser = || to_key(key).unwrap();
+        let index = to_index(&mut hash_builder.build_hasher(), key).unwrap();
+        let mut ser = None;
+        if let Some((_, v)) =
+            hash_part.get_mut(index.hash, |(k, _)| k == ser.get_or_insert_with(make_ser))
+        {
+            return Some(replace(v, value));
+        }
+
+        let ser = ser.unwrap_or_else(make_ser);
+        if let Err((ser, value)) = hash_part.try_insert_no_grow(index.hash, (ser, value)) {
+            /* 0. count up the integer entries in each size range */
+            let mut counts = Counts::new();
+            counts.tally(
+                slice_part
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, v)| v.as_ref().and(Some(i)))
+                    .map(|i| offset_of_zero.translate_index(i)),
+            );
+            counts.tally(unsafe {
+                hash_part
+                    .iter()
+                    .filter_map(|bkt| bkt.as_ref().0.as_integer())
+            });
+            counts.tally(ser.as_integer().into_iter());
+
+            let (nonneg_size, neg_size) = (counts.nonneg_size(), counts.neg_size());
+            let total_size = nonneg_size + neg_size;
+            let old_neg_size = replace(&mut offset_of_zero.0, neg_size);
+            let old_total_size = slice_part.len();
+            let old_nonneg_size = old_total_size - old_neg_size;
+
+            /* 1. move the ejected elements from the slice part to the hash part */
+            let mut move_from_index_to_hash_part = |i: usize| {
+                if let Some(v) = slice_part[i].take() {
+                    let x = Offset(old_neg_size).translate_index(i);
+                    hash_part.insert(
+                        build_digest!(hash_builder; Key::Integer(x)),
+                        (Key::Integer(x), v),
+                        |(k, _)| build_digest!(hash_builder; k),
+                    );
+                }
+            };
+            (0..old_neg_size.saturating_sub(neg_size)).for_each(&mut move_from_index_to_hash_part);
+            ((old_neg_size + nonneg_size)..(old_neg_size + old_nonneg_size))
+                .for_each(&mut move_from_index_to_hash_part);
+
+            /* 2. shrink or grow the slice part */
+            if total_size <= old_total_size {
+                slice_part.truncate(total_size);
+                slice_part.shrink_to_fit();
+            } else {
+                slice_part.reserve_exact(total_size - old_total_size);
+                slice_part.resize_with(total_size, Default::default);
+            }
+
+            /* 3. rotate the slice part to match the new offset */
+            if neg_size <= old_neg_size {
+                slice_part.rotate_left(old_neg_size - neg_size);
+            } else {
+                slice_part.rotate_right(neg_size - old_neg_size);
+            }
+
+            /* 4. move any suitable elements from the hash part to the slice part */
+            unsafe {
+                for bkt in hash_part.iter() {
+                    match bkt.as_ref() {
+                        (Key::Integer(x), _)
+                            if offset_of_zero.translate_index_inv(*x).unwrap_or(usize::MAX)
+                                < total_size =>
+                        {
+                            let i = offset_of_zero.translate_index_inv(*x).unwrap();
+                            assert!(replace(&mut slice_part[i], Some(hash_part.remove(bkt).1))
+                                .is_none());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            /* 5. insert the given pair in the right place */
+            hash_part.insert(
+                index.hash,
+                (ser, value),
+                |(k, _)| build_digest!(hash_builder; k),
+            );
+        }
+
+        None
+    }
+
+    pub fn remove_pair<K: Serialize + ?Sized>(&mut self, key: &K) -> Option<(Key, T)> {
+        let Self {
+            offset_of_zero,
+            slice_part,
+            hash_builder,
+            hash_part,
+        } = self;
+
+        if let Some(x) = to_integer(key) {
+            if let Some(i) = offset_of_zero
+                .translate_index_inv(x)
+                .filter(|&i| i < slice_part.len())
+            {
+                return take(&mut slice_part[i]).map(|v| (Key::Integer(x), v));
+            }
+        }
+
+        let make_ser = || to_key(key).unwrap();
+        let index = to_index(&mut hash_builder.build_hasher(), key).unwrap();
+        let mut ser = None;
+        if let Some((k, v)) =
+            hash_part.remove_entry(index.hash, |(k, _)| k == ser.get_or_insert_with(make_ser))
+        {
+            return Some((k, v));
+        }
+
+        None
+    }
+
+    pub fn clear(&mut self) {
+        self.slice_part.iter_mut().filter_map(take).for_each(drop);
+        self.hash_part.clear();
+    }
+}
+
+impl<T, S> IntoIterator for Table<T, S> {
+    type Item = (Key, T);
+    type IntoIter = IntoIter<T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        IntoIter(_IntoIter::InSlice(
+            self.offset_of_zero.translate_index(0),
+            self.slice_part.into_iter(),
+            self.hash_part,
+        ))
     }
 }
 
@@ -1390,6 +886,7 @@ mod tests {
         use alloc::borrow::ToOwned;
         use alloc::collections::BTreeMap;
         use alloc::vec::Vec;
+        use alloc::string::String;
         use core::hash::{Hash, Hasher};
         use serde::{Serialize, Serializer};
         use serde_derive::Serialize;
